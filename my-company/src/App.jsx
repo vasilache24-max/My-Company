@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { supabase } from "./supabaseClient";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfjsWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 import {
@@ -8,19 +9,14 @@ import {
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 function App() {
-  const [user, setUser] = useState(() => {
-    const saved = localStorage.getItem("user");
-    return saved ? JSON.parse(saved) : null;
-  });
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   const [authMode, setAuthMode] = useState("login");
   const [authForm, setAuthForm] = useState({ name: "", email: "", password: "", confirm: "" });
   const [authError, setAuthError] = useState("");
 
-  const [transactions, setTransactions] = useState(() => {
-    const saved = localStorage.getItem("transactions");
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [transactions, setTransactions] = useState([]);
 
   const [activePage, setActivePage] = useState("dashboard");
   const [description, setDescription] = useState("");
@@ -33,10 +29,7 @@ function App() {
   const [selectedMonth, setSelectedMonth] = useState("");
   const [selectedYear, setSelectedYear] = useState("");
   const [selectedIds, setSelectedIds] = useState(new Set());
-  const [uploadedFiles, setUploadedFiles] = useState(() => {
-    const saved = localStorage.getItem("uploadedFiles");
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [uploadedFiles, setUploadedFiles] = useState([]);
   const [confirmDeleteFileId, setConfirmDeleteFileId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [chatMessages, setChatMessages] = useState([
@@ -44,38 +37,66 @@ function App() {
   ]);
   const [chatInput, setChatInput] = useState("");
 
-  const [flota, setFlota] = useState(() => JSON.parse(localStorage.getItem("flota") || "[]"));
-  const [chirii, setChirii] = useState(() => JSON.parse(localStorage.getItem("chirii") || "[]"));
-  const [asigurari, setAsigurari] = useState(() => JSON.parse(localStorage.getItem("asigurari") || "[]"));
-  const [abonamente, setAbonamente] = useState(() => JSON.parse(localStorage.getItem("abonamente") || "[]"));
+  const [flota, setFlota] = useState([]);
+  const [chirii, setChirii] = useState([]);
+  const [asigurari, setAsigurari] = useState([]);
+  const [abonamente, setAbonamente] = useState([]);
   const [addingTo, setAddingTo] = useState(null);
   const [homeForm, setHomeForm] = useState({});
   const [expandedItem, setExpandedItem] = useState(null);
   const [editingItem, setEditingItem] = useState(null);
   const [editForm, setEditForm] = useState({});
 
-  const [settings, setSettings] = useState(() => {
-    const saved = localStorage.getItem("settings");
-    return saved ? JSON.parse(saved) : { companyName: "My Company", currency: "EUR" };
-  });
+  const [settings, setSettings] = useState({ companyName: "My Company", currency: "EUR" });
   const [settingsForm, setSettingsForm] = useState(settings);
 
-  useEffect(() => {
-    localStorage.setItem("transactions", JSON.stringify(transactions));
-  }, [transactions]);
+  const loadUserData = async (userId) => {
+    const [tx, files, fl, ch, as, ab, st] = await Promise.all([
+      supabase.from("transactions").select("*").eq("user_id", userId).order("created_at", { ascending: false }),
+      supabase.from("uploaded_files").select("*").eq("user_id", userId).order("created_at", { ascending: false }),
+      supabase.from("flota").select("*").eq("user_id", userId),
+      supabase.from("chirii").select("*").eq("user_id", userId),
+      supabase.from("asigurari").select("*").eq("user_id", userId),
+      supabase.from("abonamente").select("*").eq("user_id", userId),
+      supabase.from("settings").select("*").eq("user_id", userId).maybeSingle(),
+    ]);
+    if (tx.data) setTransactions(tx.data);
+    if (files.data) setUploadedFiles(files.data);
+    if (fl.data) setFlota(fl.data);
+    if (ch.data) setChirii(ch.data);
+    if (as.data) setAsigurari(as.data);
+    if (ab.data) setAbonamente(ab.data);
+    if (st.data) {
+      const s = { companyName: st.data.company_name, currency: st.data.currency };
+      setSettings(s);
+      setSettingsForm(s);
+    }
+    setLoading(false);
+  };
 
   useEffect(() => {
-    localStorage.setItem("uploadedFiles", JSON.stringify(uploadedFiles));
-  }, [uploadedFiles]);
-
-  useEffect(() => {
-    localStorage.setItem("settings", JSON.stringify(settings));
-  }, [settings]);
-
-  useEffect(() => { localStorage.setItem("flota", JSON.stringify(flota)); }, [flota]);
-  useEffect(() => { localStorage.setItem("chirii", JSON.stringify(chirii)); }, [chirii]);
-  useEffect(() => { localStorage.setItem("asigurari", JSON.stringify(asigurari)); }, [asigurari]);
-  useEffect(() => { localStorage.setItem("abonamente", JSON.stringify(abonamente)); }, [abonamente]);
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        const u = session.user;
+        setUser({ id: u.id, name: u.user_metadata?.name || u.email, email: u.email });
+        loadUserData(u.id);
+      } else {
+        setLoading(false);
+      }
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        const u = session.user;
+        setUser({ id: u.id, name: u.user_metadata?.name || u.email, email: u.email });
+      } else {
+        setUser(null);
+        setTransactions([]); setUploadedFiles([]);
+        setFlota([]); setChirii([]); setAsigurari([]); setAbonamente([]);
+        setSettings({ companyName: "My Company", currency: "EUR" });
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   const homeCategories = {
     flota: {
@@ -135,57 +156,66 @@ function App() {
     },
   };
 
-  const addHomeItem = (catKey) => {
+  const addHomeItem = async (catKey) => {
     const cat = homeCategories[catKey];
-    const item = { id: Date.now(), ...homeForm };
+    const item = { id: Date.now(), user_id: user.id, ...homeForm };
+    await supabase.from(catKey).insert(item);
     cat.setState((prev) => [...prev, item]);
-    setAddingTo(null);
-    setHomeForm({});
+    setAddingTo(null); setHomeForm({});
   };
 
-  const deleteHomeItem = (catKey, id) => {
+  const deleteHomeItem = async (catKey, id) => {
+    await supabase.from(catKey).delete().eq("id", id);
     homeCategories[catKey].setState((prev) => prev.filter((i) => i.id !== id));
   };
 
-  const updateHomeItem = (catKey, id) => {
+  const updateHomeItem = async (catKey, id) => {
+    const { id: _id, user_id: _uid, ...fields } = editForm;
+    await supabase.from(catKey).update(fields).eq("id", id);
     homeCategories[catKey].setState((prev) =>
       prev.map((i) => i.id === id ? { ...i, ...editForm } : i)
     );
-    setEditingItem(null);
-    setEditForm({});
+    setEditingItem(null); setEditForm({});
   };
 
-  const handleLogin = () => {
-    const users = JSON.parse(localStorage.getItem("users") || "[]");
-    const found = users.find((u) => u.email === authForm.email && u.password === authForm.password);
-    if (!found) { setAuthError("Email sau parolă greșită."); return; }
-    setUser(found);
-    localStorage.setItem("user", JSON.stringify(found));
+  const handleLogin = async () => {
     setAuthError("");
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authForm.email, password: authForm.password,
+    });
+    if (error) { setAuthError("Email sau parolă greșită."); return; }
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.user) {
+      const u = session.user;
+      setUser({ id: u.id, name: u.user_metadata?.name || u.email, email: u.email });
+      setLoading(true);
+      await loadUserData(u.id);
+    }
   };
 
-  const handleRegister = () => {
+  const handleRegister = async () => {
     if (!authForm.name || !authForm.email || !authForm.password) {
       setAuthError("Completează toate câmpurile."); return;
     }
     if (authForm.password !== authForm.confirm) {
       setAuthError("Parolele nu coincid."); return;
     }
-    const users = JSON.parse(localStorage.getItem("users") || "[]");
-    if (users.find((u) => u.email === authForm.email)) {
-      setAuthError("Există deja un cont cu acest email."); return;
-    }
-    const newUser = { name: authForm.name, email: authForm.email, password: authForm.password };
-    users.push(newUser);
-    localStorage.setItem("users", JSON.stringify(users));
-    setUser(newUser);
-    localStorage.setItem("user", JSON.stringify(newUser));
     setAuthError("");
+    const { data, error } = await supabase.auth.signUp({
+      email: authForm.email, password: authForm.password,
+      options: { data: { name: authForm.name } },
+    });
+    if (error) { setAuthError(error.message); return; }
+    if (data.user) {
+      const u = data.user;
+      setUser({ id: u.id, name: authForm.name, email: u.email });
+      setLoading(true);
+      await loadUserData(u.id);
+    }
   };
 
-  const handleLogout = () => {
-    setUser(null);
-    localStorage.removeItem("user");
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
     setActivePage("dashboard");
     setAuthForm({ name: "", email: "", password: "", confirm: "" });
   };
@@ -313,42 +343,49 @@ function App() {
 
         newTransactions.push({
           id: Date.now() + newTransactions.length,
-          fileId,
+          file_id: fileId,
           date, description: desc, amount: txAmount, type: txType, category: cat,
         });
       }
     }
 
+    const txWithUser = newTransactions.map((t) => ({ ...t, user_id: user.id }));
+    if (txWithUser.length > 0) await supabase.from("transactions").insert(txWithUser);
+    const fileEntry = { id: fileId, user_id: user.id, name: file.name, date: new Date().toLocaleDateString("ro-RO"), count: newTransactions.length };
+    await supabase.from("uploaded_files").insert(fileEntry);
     setTransactions((prev) => [...prev, ...newTransactions]);
-    setUploadedFiles((prev) => [...prev, {
-      id: fileId,
-      name: file.name,
-      date: new Date().toLocaleDateString("ro-RO"),
-      count: newTransactions.length,
-    }]);
+    setUploadedFiles((prev) => [...prev, fileEntry]);
   };
 
-  const deleteFile = (fileId) => {
-    setTransactions((prev) => prev.filter((t) => t.fileId !== fileId));
+  const deleteFile = async (fileId) => {
+    await supabase.from("transactions").delete().eq("file_id", fileId);
+    await supabase.from("uploaded_files").delete().eq("id", fileId);
+    setTransactions((prev) => prev.filter((t) => t.file_id !== fileId));
     setUploadedFiles((prev) => prev.filter((f) => f.id !== fileId));
     setConfirmDeleteFileId(null);
   };
 
-  const addTransaction = () => {
+  const addTransaction = async () => {
     if (!description || !amount) return;
-    setTransactions([{
-      id: Date.now(),
+    const item = {
+      id: Date.now(), user_id: user.id,
       date: new Date().toLocaleDateString("ro-RO"),
       description, amount: Number(amount), type, category,
-    }, ...transactions]);
-    setDescription("");
-    setAmount("");
+    };
+    await supabase.from("transactions").insert(item);
+    setTransactions((prev) => [item, ...prev]);
+    setDescription(""); setAmount("");
   };
 
-  const deleteTransaction = (id) => setTransactions(transactions.filter((t) => t.id !== id));
+  const deleteTransaction = async (id) => {
+    await supabase.from("transactions").delete().eq("id", id);
+    setTransactions((prev) => prev.filter((t) => t.id !== id));
+  };
 
-  const deleteSelected = () => {
-    setTransactions(transactions.filter((t) => !selectedIds.has(t.id)));
+  const deleteSelected = async () => {
+    const ids = [...selectedIds];
+    await supabase.from("transactions").delete().in("id", ids);
+    setTransactions((prev) => prev.filter((t) => !selectedIds.has(t.id)));
     setSelectedIds(new Set());
   };
 
@@ -545,6 +582,19 @@ function App() {
       .sort((a, b) => Number(a.zi) - Number(b.zi))
       .map((d) => ({ ...d, Profit: d.Venit - d.Costuri }));
   })();
+
+  // ── LOADING ────────────────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f3f4f6" }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: "40px", height: "40px", border: "4px solid #e5e7eb", borderTop: "4px solid #2563eb", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 16px" }} />
+          <p style={{ color: "#6b7280", fontSize: "14px" }}>Se încarcă datele...</p>
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
 
   // ── LOGIN / REGISTER PAGE ──────────────────────────────────────────────────
   if (!user) {
@@ -1273,7 +1323,10 @@ function App() {
                 </select>
               </div>
               <button style={{ ...styles.button, marginTop: "16px" }}
-                onClick={() => setSettings(settingsForm)}>
+                onClick={async () => {
+                  setSettings(settingsForm);
+                  await supabase.from("settings").upsert({ user_id: user.id, company_name: settingsForm.companyName, currency: settingsForm.currency });
+                }}>
                 Salvează
               </button>
             </section>
