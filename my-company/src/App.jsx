@@ -46,6 +46,8 @@ function App() {
   const [expandedItem, setExpandedItem] = useState(null);
   const [editingItem, setEditingItem] = useState(null);
   const [editForm, setEditForm] = useState({});
+  const [editingTxId, setEditingTxId] = useState(null);
+  const [editTxForm, setEditTxForm] = useState({});
 
   const [settings, setSettings] = useState({ companyName: "My Company", currency: "EUR" });
   const [settingsForm, setSettingsForm] = useState(settings);
@@ -98,6 +100,33 @@ function App() {
     return () => subscription.unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!user || flota.length === 0) return;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const expiring = flota.filter((car) => {
+      if (!car.keuring_expirare) return false;
+      const p = car.keuring_expirare.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+      if (!p) return false;
+      const exp = new Date(Number(p[3]), Number(p[2]) - 1, Number(p[1]));
+      const days = Math.ceil((exp - today) / 86400000);
+      return days >= 0 && days <= 10;
+    });
+    if (expiring.length === 0) return;
+    if (!("Notification" in window)) return;
+    Notification.requestPermission().then((perm) => {
+      if (perm !== "granted") return;
+      expiring.forEach((car) => {
+        const p = car.keuring_expirare.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+        const exp = new Date(Number(p[3]), Number(p[2]) - 1, Number(p[1]));
+        const days = Math.ceil((exp - today) / 86400000);
+        new Notification("Keuring expiră curând!", {
+          body: `${car.marca || ""} ${car.model || ""} (${car.numar || ""}) — mai ${days === 0 ? "azi!" : `${days} zile`} (${car.keuring_expirare})`,
+          icon: "/favicon.ico",
+        });
+      });
+    });
+  }, [user, flota]);
+
   const homeCategories = {
     flota: {
       label: "Flotă", icon: "🚗", color: "#2563eb",
@@ -109,6 +138,10 @@ function App() {
         { key: "km",       label: "Kilometraj",         placeholder: "ex: 85000" },
         { key: "combustibil", label: "Combustibil",     placeholder: "Diesel / Benzină / Electric" },
         { key: "note",     label: "Note",               placeholder: "Observații" },
+        { key: "leasing_inceput", label: "Leasing început", placeholder: "ex: 01.01.2024", section: "Leasing" },
+        { key: "leasing_sfarsit", label: "Leasing sfârșit", placeholder: "ex: 01.01.2027", section: "Leasing" },
+        { key: "leasing_stare",   label: "Stare leasing",   placeholder: "ex: Activ / Achitat", section: "Leasing" },
+        { key: "keuring_expirare", label: "Keuring expiră", placeholder: "ex: 15.06.2025", section: "Keuring" },
       ],
       state: flota, setState: setFlota,
       display: (item) => `${item.marca || ""} ${item.model || ""} — ${item.numar || ""}`,
@@ -229,123 +262,256 @@ function App() {
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     const newTransactions = [];
-    let lastSeenDate = new Date().toLocaleDateString("ro-RO");
 
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const textContent = await page.getTextContent();
+    const catFromText = (lower) => {
+      if (/gaz|fuel|petrol|benzin|combustibil|forte gaz|q8|rompetrol|mol /.test(lower)) return "Combustibil";
+      if (/leasing/.test(lower)) return "Leasing";
+      if (/tax|impozit|tva|onss|rsvz/.test(lower)) return "Taxe";
+      if (/salar|salary|securex|payroll/.test(lower)) return "Salarii";
+      if (/client|factur|invoice/.test(lower)) return "Client";
+      return "Diverse";
+    };
 
-      const rowMap = {};
-      textContent.items.forEach((item) => {
-        if (!item.str.trim()) return;
-        const y = Math.round(item.transform[5] / 4) * 4;
-        if (!rowMap[y]) rowMap[y] = [];
-        rowMap[y].push({ text: item.str.trim(), x: Math.round(item.transform[4]) });
-      });
+    // Detectează formatul băncii din prima pagină
+    const page1 = await pdf.getPage(1);
+    const tc1 = await page1.getTextContent();
+    const allText1 = tc1.items.map((i) => i.str).join(" ");
+    const isBNP = /BNP|GEBABEBB|BBRUBEBB|bnpparibasfortis/i.test(allText1);
 
-      const rows = Object.entries(rowMap)
-        .sort(([a], [b]) => Number(b) - Number(a))
-        .map(([, cols]) => cols.sort((a, b) => a.x - b.x));
+    if (isBNP) {
+      // ── PARSER BNP PARIBAS FORTIS ──────────────────────────────────────────
+      let currentYear = new Date().getFullYear().toString();
+      let lastDate = new Date().toLocaleDateString("ro-RO");
 
-      // Recunoaște sume cu semn opțional prefix sau sufix: 1.234,56 / 1.234,56+ / -1.234,56
-      const amountRegex = /^[+\-]?\d{1,3}(?:[. ]\d{3})*,\d{2}[+\-]?$/;
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const tc = await page.getTextContent();
 
-      const parseAmountCell = (text) => {
-        const match = text.match(/^([+\-]?)(\d{1,3}(?:[. ]\d{3})*,\d{2})([+\-]?)$/);
-        if (!match) return null;
-        const sign = match[1] || match[3];
-        const num = parseFloat(match[2].replace(/[. ]/g, "").replace(",", "."));
-        if (isNaN(num) || num === 0) return null;
-        return { amount: num, sign };
-      };
-
-      // Detectează coloane Debit/Credit din antet (fallback dacă nu există semne)
-      let debitX = null;
-      let creditX = null;
-      for (const row of rows) {
-        for (const cell of row) {
-          const t = cell.text.toLowerCase();
-          if (/^(debit|ieșiri|iesiri|plăți|plati|out)$/.test(t)) debitX = cell.x;
-          if (/^(credit|intrări|intrari|încasări|incasari|in)$/.test(t)) creditX = cell.x;
-        }
-        if (debitX !== null && creditX !== null) break;
-      }
-
-      for (const row of rows) {
-        const amountCells = row
-          .map((c, idx) => ({ ...parseAmountCell(c.text), x: c.x, idx }))
-          .filter((c) => c.amount);
-
-        if (amountCells.length === 0) continue;
-
-        const rowText = row.map((c) => c.text).join(" ");
-        const lower = rowText.toLowerCase();
-
-        if (/sold\s*(initial|final)|balance|total|data\s+descriere/.test(lower)) continue;
-
-        // Caută date în mai multe formate: 15.01.2024 / 15-01-2024 / 15/01/2024 / 2024-01-15
-        const dateMatch = rowText.match(/(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})|(\d{4}[.\-\/]\d{2}[.\-\/]\d{2})/);
-        if (dateMatch) lastSeenDate = dateMatch[0];
-        const date = lastSeenDate;
-
-        let txType = "cost";
-        let txAmount = 0;
-
-        const mainAmt = amountCells[0];
-
-        if (mainAmt.sign === "+") {
-          // Semn explicit + → venit
-          txType = "venit";
-          txAmount = mainAmt.amount;
-        } else if (mainAmt.sign === "-") {
-          // Semn explicit - → cost
-          txType = "cost";
-          txAmount = mainAmt.amount;
-        } else {
-          // Verifică dacă celula adiacentă (imediat după sumă) este + sau -
-          const nextCell = row[mainAmt.idx + 1];
-          if (nextCell && nextCell.text.trim() === "+") {
-            txType = "venit";
-          } else if (nextCell && nextCell.text.trim() === "-") {
-            txType = "cost";
-          } else if (debitX !== null && creditX !== null) {
-            // Fallback pe poziția coloanei
-            const distToDebit = Math.abs(mainAmt.x - debitX);
-            const distToCredit = Math.abs(mainAmt.x - creditX);
-            txType = distToCredit < distToDebit ? "venit" : "cost";
-          } else if (/credit|received|incoming|intrare|încasat|incasat/.test(lower)) {
-            txType = "venit";
-          }
-          txAmount = mainAmt.amount;
-        }
-
-        if (!txAmount || txAmount <= 0) continue;
-
-        // Construiește descrierea excludând sumele și datele
-        let desc = row
-          .filter((c) => !amountRegex.test(c.text) && !/^\d{2}[.\-\/]/.test(c.text) && c.text !== "+" && c.text !== "-")
-          .map((c) => c.text).join(" ").trim();
-
-        // Dacă descrierea e goală, folosește tot textul rândului (fără sume)
-        if (!desc) {
-          desc = rowText.replace(amountRegex, "").replace(/[+\-]\s*$/, "").trim();
-        }
-        if (!desc) continue;
-
-        desc = desc.substring(0, 60);
-
-        let cat = "Diverse";
-        if (/fuel|petrol|benzin|combustibil/.test(lower)) cat = "Combustibil";
-        else if (/leasing/.test(lower)) cat = "Leasing";
-        else if (/tax|taxă|taxa|impozit/.test(lower)) cat = "Taxe";
-        else if (/salar|salary/.test(lower)) cat = "Salarii";
-        else if (/client|factur|invoice/.test(lower)) cat = "Client";
-
-        newTransactions.push({
-          id: Date.now() + newTransactions.length,
-          file_id: fileId,
-          date, description: desc, amount: txAmount, type: txType, category: cat,
+        const rowMap = {};
+        tc.items.forEach((item) => {
+          if (!item.str.trim()) return;
+          const y = Math.round(item.transform[5]);
+          if (!rowMap[y]) rowMap[y] = [];
+          rowMap[y].push({ text: item.str.trim(), x: Math.round(item.transform[4]) });
         });
+
+        const sortedRows = Object.entries(rowMap)
+          .sort(([a], [b]) => Number(b) - Number(a))
+          .map(([, cols]) => cols.sort((a, b) => a.x - b.x));
+
+        for (const cols of sortedRows) {
+          const first = cols[0];
+          if (!first) continue;
+
+          // Rând antet dată secțiune: "31-01-2026" la x<60
+          if (first.x < 60 && /^\d{2}-\d{2}-\d{4}$/.test(first.text)) {
+            currentYear = first.text.split("-")[2];
+            continue;
+          }
+
+          // Rând tranzacție: număr 4 cifre la x<60 (ex: "0027")
+          if (first.x >= 60 || !/^\d{4}$/.test(first.text)) continue;
+
+          // Suma: ultima coloană la x≥490, format "1.234,56 -" sau "1.234,56+"
+          const amtCol = cols.filter((c) => c.x >= 490).pop();
+          if (!amtCol) continue;
+          const amtMatch = amtCol.text.match(/^([\d.]+,\d{2})\s*([+\-])$|^([\d.]+,\d{2})([+\-])$/);
+          if (!amtMatch) continue;
+          const amount = parseFloat((amtMatch[1] || amtMatch[3]).replace(/\./g, "").replace(",", "."));
+          const sign = amtMatch[2] || amtMatch[4];
+          if (!amount || amount <= 0) continue;
+
+          // Data valorii: la x≈442, format "DD-MM"
+          const dateCol = cols.find((c) => c.x >= 430 && c.x <= 465);
+          if (dateCol) {
+            const dm = dateCol.text.match(/^(\d{2})-(\d{2})$/);
+            if (dm) lastDate = `${dm[1]}.${dm[2]}.${currentYear}`;
+          }
+
+          // Descriere: contrapartidă la x≈305 (numele companiei), altfel tipul operațiunii
+          const counterpart = cols.find((c) => c.x >= 290 && c.x <= 320);
+          const opType = cols.find((c) => c.x >= 70 && c.x <= 85);
+          const desc = (counterpart?.text || opType?.text || "BNP tranzacție").substring(0, 60);
+
+          newTransactions.push({
+            id: Date.now() + newTransactions.length,
+            file_id: fileId,
+            date: lastDate,
+            description: desc,
+            amount,
+            type: sign === "+" ? "venit" : "cost",
+            category: catFromText(desc.toLowerCase()),
+          });
+        }
+      }
+    } else if (/KBC|KREDBEBB/i.test(allText1)) {
+      // ── PARSER KBC ─────────────────────────────────────────────────────────
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const tc = await page.getTextContent();
+
+        const rowMap = {};
+        tc.items.forEach((item) => {
+          if (!item.str.trim()) return;
+          const y = Math.round(item.transform[5]);
+          if (!rowMap[y]) rowMap[y] = [];
+          rowMap[y].push({ text: item.str.trim(), x: Math.round(item.transform[4]) });
+        });
+
+        // Sortăm rândurile de sus în jos (y descrescător)
+        const sortedRows = Object.entries(rowMap)
+          .sort(([a], [b]) => Number(b) - Number(a))
+          .map(([, cols]) => cols.sort((a, b) => a.x - b.x));
+
+        let pendingTx = null;
+        const pushPending = () => {
+          if (!pendingTx) return;
+          const { date, opType, amount, sign, details } = pendingTx;
+          let desc = opType;
+          for (const line of details) {
+            if (/^BE\d{14,}$/.test(line.replace(/\s/g, ""))) continue;
+            if (/^(ORDERING BANK|BENEFICIARY.S BANK|CARDHOLDER|WITH KBC|INFO FROM|CREDITOR REF|MANDATE REF|REFERENCE\s*:)/i.test(line)) continue;
+            if (/AT \d{2}[.:]\d{2}/i.test(line)) continue;
+            if (/^\d{2}-\d{2}-\d{4}/.test(line)) continue;
+            if (/^\d{4}\s+\d{2}XX/.test(line)) continue;
+            if (/^[A-Z0-9\/\-\.]{8,}$/.test(line) && !/\s/.test(line)) continue;
+            desc = line.replace(/^(CREDITOR|OWN DESCRIPTION)\s*:\s*/i, "").trim();
+            if (desc) break;
+          }
+          newTransactions.push({
+            id: Date.now() + newTransactions.length,
+            file_id: fileId,
+            date, description: desc.substring(0, 60), amount,
+            type: sign === "+" ? "venit" : "cost",
+            category: catFromText(desc.toLowerCase()),
+          });
+          pendingTx = null;
+        };
+
+        for (const cols of sortedRows) {
+          const first = cols[0];
+          if (!first) continue;
+
+          // Rând principal KBC: "061 15-04-2025" la x<60
+          const mainMatch = first.x < 60 && first.text.match(/^(\d{3})\s+(\d{2}-\d{2}-\d{4})$/);
+          if (mainMatch) {
+            pushPending();
+            // Suma: coloană la x≥490, format "25 000,00 -" sau "710,50 +"
+            const amtCol = cols.filter((c) => c.x >= 490).pop();
+            if (!amtCol) continue;
+            const amtMatch = amtCol.text.match(/^([\d ]+,\d{2})\s*([+\-])$/);
+            if (!amtMatch) continue;
+            const amount = parseFloat(amtMatch[1].replace(/ /g, "").replace(",", "."));
+            if (!amount || amount <= 0) continue;
+            const [, , dateStr] = mainMatch;
+            const [d, m, y] = dateStr.split("-");
+            const opCol = cols.find((c) => c.x >= 120 && c.x <= 140);
+            pendingTx = {
+              date: `${d}.${m}.${y}`,
+              opType: opCol?.text || "KBC tranzacție",
+              amount,
+              sign: amtMatch[2],
+              details: [],
+            };
+            continue;
+          }
+
+          // Rând detaliu: colectăm textele pentru descriere
+          if (pendingTx) {
+            // Combinăm celulele de pe același rând (ex: "CREDITOR" + ": FORD")
+            const lineText = cols.map((c) => c.text).join(" ").replace(/\s+/g, " ").trim();
+            if (lineText && !/^(no\s+date|description|value date|amount|Balance on)/i.test(lineText)) {
+              pendingTx.details.push(lineText);
+            }
+          }
+        }
+        pushPending();
+      }
+    } else {
+      // ── PARSER GENERIC (alte bănci) ─────────────────────────────────────────
+      let lastSeenDate = new Date().toLocaleDateString("ro-RO");
+
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const textContent = await page.getTextContent();
+
+        const rowMap = {};
+        textContent.items.forEach((item) => {
+          if (!item.str.trim()) return;
+          const y = Math.round(item.transform[5] / 4) * 4;
+          if (!rowMap[y]) rowMap[y] = [];
+          rowMap[y].push({ text: item.str.trim(), x: Math.round(item.transform[4]) });
+        });
+
+        const rows = Object.entries(rowMap)
+          .sort(([a], [b]) => Number(b) - Number(a))
+          .map(([, cols]) => cols.sort((a, b) => a.x - b.x));
+
+        const amountRegex = /^[+\-]?\d{1,3}(?:[. ]\d{3})*,\d{2}[+\-]?$/;
+        const parseAmountCell = (text) => {
+          const match = text.match(/^([+\-]?)(\d{1,3}(?:[. ]\d{3})*,\d{2})([+\-]?)$/);
+          if (!match) return null;
+          const sign = match[1] || match[3];
+          const num = parseFloat(match[2].replace(/[. ]/g, "").replace(",", "."));
+          if (isNaN(num) || num === 0) return null;
+          return { amount: num, sign };
+        };
+
+        let debitX = null, creditX = null;
+        for (const row of rows) {
+          for (const cell of row) {
+            const t = cell.text.toLowerCase();
+            if (/^(debit|ieșiri|iesiri|plăți|plati|out)$/.test(t)) debitX = cell.x;
+            if (/^(credit|intrări|intrari|încasări|incasari|in)$/.test(t)) creditX = cell.x;
+          }
+          if (debitX !== null && creditX !== null) break;
+        }
+
+        for (const row of rows) {
+          const amountCells = row
+            .map((c, idx) => ({ ...parseAmountCell(c.text), x: c.x, idx }))
+            .filter((c) => c.amount);
+          if (amountCells.length === 0) continue;
+
+          const rowText = row.map((c) => c.text).join(" ");
+          const lower = rowText.toLowerCase();
+          if (/sold\s*(initial|final)|balance|total|data\s+descriere/.test(lower)) continue;
+
+          const dateMatch = rowText.match(/(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})|(\d{4}[.\-\/]\d{2}[.\-\/]\d{2})/);
+          if (dateMatch) lastSeenDate = dateMatch[0];
+
+          const mainAmt = amountCells[0];
+          let txType = "cost", txAmount = 0;
+
+          if (mainAmt.sign === "+") { txType = "venit"; txAmount = mainAmt.amount; }
+          else if (mainAmt.sign === "-") { txType = "cost"; txAmount = mainAmt.amount; }
+          else {
+            const nextCell = row[mainAmt.idx + 1];
+            if (nextCell?.text.trim() === "+") txType = "venit";
+            else if (nextCell?.text.trim() === "-") txType = "cost";
+            else if (debitX !== null && creditX !== null) {
+              txType = Math.abs(mainAmt.x - creditX) < Math.abs(mainAmt.x - debitX) ? "venit" : "cost";
+            } else if (/credit|received|incoming|intrare|încasat|incasat/.test(lower)) {
+              txType = "venit";
+            }
+            txAmount = mainAmt.amount;
+          }
+          if (!txAmount || txAmount <= 0) continue;
+
+          let desc = row
+            .filter((c) => !amountRegex.test(c.text) && !/^\d{2}[.\-\/]/.test(c.text) && c.text !== "+" && c.text !== "-")
+            .map((c) => c.text).join(" ").trim();
+          if (!desc) desc = rowText.replace(amountRegex, "").replace(/[+\-]\s*$/, "").trim();
+          if (!desc) continue;
+          desc = desc.substring(0, 60);
+
+          newTransactions.push({
+            id: Date.now() + newTransactions.length,
+            file_id: fileId,
+            date: lastSeenDate, description: desc, amount: txAmount,
+            type: txType, category: catFromText(lower),
+          });
+        }
       }
     }
 
@@ -387,6 +553,15 @@ function App() {
     await supabase.from("transactions").delete().in("id", ids);
     setTransactions((prev) => prev.filter((t) => !selectedIds.has(t.id)));
     setSelectedIds(new Set());
+  };
+
+  const updateTransaction = async (id) => {
+    const { id: _id, user_id: _uid, created_at: _ca, ...fields } = editTxForm;
+    fields.amount = Number(fields.amount);
+    await supabase.from("transactions").update(fields).eq("id", id);
+    setTransactions((prev) => prev.map((t) => t.id === id ? { ...t, ...fields } : t));
+    setEditingTxId(null);
+    setEditTxForm({});
   };
 
   const toggleSelect = (id) => {
@@ -789,6 +964,40 @@ function App() {
                 <p style={styles.subtitle}>Gestionează resursele firmei tale.</p>
               </div>
             </div>
+
+            {(() => {
+              const today = new Date(); today.setHours(0, 0, 0, 0);
+              const alerts = flota.filter((car) => {
+                if (!car.keuring_expirare) return false;
+                const p = car.keuring_expirare.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+                if (!p) return false;
+                const exp = new Date(Number(p[3]), Number(p[2]) - 1, Number(p[1]));
+                return Math.ceil((exp - today) / 86400000) <= 10;
+              });
+              if (alerts.length === 0) return null;
+              return (
+                <div style={{ marginBottom: "20px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                  {alerts.map((car) => {
+                    const p = car.keuring_expirare.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+                    const exp = new Date(Number(p[3]), Number(p[2]) - 1, Number(p[1]));
+                    const days = Math.ceil((exp - today) / 86400000);
+                    return (
+                      <div key={car.id} style={{ background: days <= 0 ? "#fef2f2" : "#fffbeb", border: `1px solid ${days <= 0 ? "#fca5a5" : "#fcd34d"}`, borderRadius: "12px", padding: "12px 16px", display: "flex", alignItems: "center", gap: "12px" }}>
+                        <span style={{ fontSize: "20px" }}>{days <= 0 ? "🚨" : "⚠️"}</span>
+                        <div>
+                          <p style={{ margin: 0, fontWeight: "700", fontSize: "14px", color: days <= 0 ? "#dc2626" : "#92400e" }}>
+                            Keuring {days <= 0 ? "expirat!" : `expiră în ${days} ${days === 1 ? "zi" : "zile"}!`}
+                          </p>
+                          <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#6b7280" }}>
+                            {car.marca} {car.model} ({car.numar}) — {car.keuring_expirare}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
               {Object.entries(homeCategories).map(([catKey, cat]) => (
@@ -1212,7 +1421,26 @@ function App() {
                       {filteredTx.length === 0 ? (
                         <p style={styles.empty}>Nicio tranzacție în această categorie.</p>
                       ) : (
-                        pageTx.map(t => (
+                        pageTx.map(t => editingTxId === t.id ? (
+                          <div key={t.id} style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb", background: "#f0f9ff", display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
+                            <input style={{ ...styles.input, padding: "5px 8px", fontSize: "12px", width: "100px" }} value={editTxForm.date || ""} onChange={e => setEditTxForm({ ...editTxForm, date: e.target.value })} placeholder="Data" />
+                            <input style={{ ...styles.input, padding: "5px 8px", fontSize: "12px", flex: 1, minWidth: "120px" }} value={editTxForm.description || ""} onChange={e => setEditTxForm({ ...editTxForm, description: e.target.value })} placeholder="Descriere" />
+                            <select style={{ ...styles.input, padding: "5px 8px", fontSize: "12px", width: "120px" }} value={editTxForm.category || ""} onChange={e => setEditTxForm({ ...editTxForm, category: e.target.value })}>
+                              <option>Client</option><option>Salarii</option><option>Subcontractori</option>
+                              <option>Combustibil</option><option>Leasing</option><option>Materiale</option>
+                              <option>Taxe</option><option>Diverse</option>
+                            </select>
+                            <select style={{ ...styles.input, padding: "5px 8px", fontSize: "12px", width: "90px" }} value={editTxForm.type || ""} onChange={e => setEditTxForm({ ...editTxForm, type: e.target.value })}>
+                              <option value="venit">Venit</option>
+                              <option value="cost">Cost</option>
+                            </select>
+                            <input style={{ ...styles.input, padding: "5px 8px", fontSize: "12px", width: "90px" }} type="number" value={editTxForm.amount || ""} onChange={e => setEditTxForm({ ...editTxForm, amount: e.target.value })} placeholder="Sumă" />
+                            <div style={{ display: "flex", gap: "6px" }}>
+                              <button style={{ ...styles.button, padding: "5px 12px", fontSize: "12px" }} onClick={() => updateTransaction(t.id)}>Salvează</button>
+                              <button style={{ ...styles.button, padding: "5px 12px", fontSize: "12px", background: "#6b7280" }} onClick={() => { setEditingTxId(null); setEditTxForm({}); }}>Anulează</button>
+                            </div>
+                          </div>
+                        ) : (
                           <div key={t.id} style={{
                             ...styles.tableRow,
                             gridTemplateColumns: "32px 1fr 2fr 1.3fr 1fr 1fr auto",
@@ -1225,7 +1453,10 @@ function App() {
                             <span>{t.category}</span>
                             <span style={t.type === "venit" ? styles.income : styles.cost}>{t.type}</span>
                             <strong style={{ color: t.type === "venit" ? "#16a34a" : "#dc2626" }}>{formatCurrency(t.amount)}</strong>
-                            <button style={styles.deleteButton} onClick={() => deleteTransaction(t.id)}>Șterge</button>
+                            <div style={{ display: "flex", gap: "4px" }}>
+                              <button style={{ ...styles.deleteButton, background: "#eff6ff", color: "#2563eb" }} onClick={() => { setEditingTxId(t.id); setEditTxForm({ ...t }); }}>✏</button>
+                              <button style={styles.deleteButton} onClick={() => deleteTransaction(t.id)}>✕</button>
+                            </div>
                           </div>
                         ))
                       )}
